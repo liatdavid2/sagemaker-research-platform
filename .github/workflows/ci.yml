@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python syntax
+        run: |
+          python -m py_compile ui/backend/app.py
+          python -m py_compile examples/pytorch_vision/train.py
+          python -m py_compile examples/sklearn_tabular/train.py
+          python -m py_compile examples/tensorflow_tabular/train.py
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: |
+          terraform init -backend=false
+          terraform fmt -check
+          terraform validate
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Frontend build
+        working-directory: ui/frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Docker Compose config
+        run: docker compose config

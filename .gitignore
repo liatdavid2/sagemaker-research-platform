@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.terraform/
+*.tfstate
+*.tfstate.*
+results/*
+!results/.gitkeep
+.local_runs/
+.DS_Store

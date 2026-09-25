@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+boto3==1.35.20
+sagemaker==2.232.2
+PyYAML==6.0.2

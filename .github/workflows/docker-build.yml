@@ -1,0 +1,17 @@
+name: Docker Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ui/**"
+      - "docker-compose.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build local platform images
+        run: docker compose build

@@ -1,0 +1,11 @@
+.env
+.env.*
+.git
+.terraform
+*.tfstate
+*.tfstate.*
+**/__pycache__
+**/*.pyc
+node_modules
+dist
+.local_runs

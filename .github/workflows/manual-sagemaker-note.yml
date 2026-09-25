@@ -1,0 +1,27 @@
+name: SageMaker Manual Run Template
+
+on:
+  workflow_dispatch:
+    inputs:
+      framework:
+        description: Framework
+        required: true
+        default: pytorch
+        type: choice
+        options: [pytorch, sklearn, tensorflow]
+      instance_count:
+        description: GPU instance count
+        required: true
+        default: "1"
+        type: choice
+        options: ["1", "2", "4"]
+
+jobs:
+  instructions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Safe template
+        run: |
+          echo "This workflow is a template."
+          echo "In production, configure GitHub OIDC to assume an AWS role, then call the same backend/API or submit a SageMaker job."
+          echo "No AWS secrets are stored in this repository."
