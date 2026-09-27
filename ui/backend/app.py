@@ -37,6 +37,15 @@ app.add_middleware(
 )
 
 jobs = {}
+
+platform_status_cache = {
+    "checked_at": 0.0,
+    "ready": False,
+    "bucket": None,
+    "role": None,
+    "error": None,
+}
+PLATFORM_STATUS_TTL_SECONDS = 10.0
 INSTANCE_TYPE = "ml.g4dn.xlarge"
 ALLOWED_COUNTS = {1, 2, 4}
 ALLOWED_FRAMEWORKS = {"pytorch", "tensorflow"}
@@ -147,27 +156,66 @@ def health():
     return {"ok": True, "project": "sagemaker-research-platform-full-ui"}
 
 
+def detect_platform_resources(force=False):
+    """
+    Persistent readiness check.
+    Does not depend on in-memory setup jobs, so browser refreshes and backend
+    restarts still recover the real AWS/Terraform state.
+    """
+    now = time.time()
+    if (
+        not force
+        and now - platform_status_cache["checked_at"] < PLATFORM_STATUS_TTL_SECONDS
+    ):
+        return dict(platform_status_cache)
+
+    result = {
+        "checked_at": now,
+        "ready": False,
+        "bucket": None,
+        "role": None,
+        "error": None,
+    }
+
+    try:
+        bucket = terraform_output("artifact_bucket")
+        role = terraform_output("sagemaker_role_arn")
+
+        if not bucket or not role:
+            raise RuntimeError("Terraform outputs are not available yet")
+
+        # Verify that the resources still exist in AWS.
+        s3_client().head_bucket(Bucket=bucket)
+
+        role_name = role.rsplit("/", 1)[-1]
+        boto3.client("iam").get_role(RoleName=role_name)
+
+        result.update({
+            "ready": True,
+            "bucket": bucket,
+            "role": role,
+        })
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    platform_status_cache.update(result)
+    return dict(platform_status_cache)
+
+
 @app.get("/api/platform-status")
 def platform_status():
     setup_jobs = [j for j in jobs.values() if j.get("type") == "setup"]
     latest = setup_jobs[-1] if setup_jobs else None
 
-    ready = False
-    bucket = None
-    role = None
-    if latest and latest.get("status") == "completed":
-        try:
-            bucket = terraform_output("artifact_bucket")
-            role = terraform_output("sagemaker_role_arn")
-            ready = bool(bucket and role)
-        except Exception:
-            ready = False
+    persistent = detect_platform_resources(force=False)
 
     return {
-        "ready": ready,
+        "ready": persistent["ready"],
         "latest_setup_job": latest,
-        "bucket": bucket,
-        "role": role,
+        "bucket": persistent["bucket"],
+        "role": persistent["role"],
+        "detected_from_aws": True,
+        "check_error": persistent["error"],
     }
 
 @app.get("/api/catalog")
@@ -237,6 +285,7 @@ def do_setup(job_id):
 
     jobs[job_id]["stage"] = "Ready"
     jobs[job_id]["progress_percent"] = 100
+    detect_platform_resources(force=True)
 
 
 @app.post("/api/destroy")
@@ -248,6 +297,13 @@ def destroy():
 
 def do_destroy(job_id):
     log(job_id, run_cmd(["terraform", "destroy", "-auto-approve", "-input=false"], cwd=TF_DIR))
+    platform_status_cache.update({
+        "checked_at": time.time(),
+        "ready": False,
+        "bucket": None,
+        "role": None,
+        "error": None,
+    })
 
 
 def registry_find_dataset(name, version):

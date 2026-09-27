@@ -149,7 +149,7 @@ function App(){
         <a className="linkButton" href="http://localhost:5050" target="_blank" rel="noreferrer">Open MLflow</a>
       </div>
 
-      {setupJob && <div className={`setupStatus ${setupJob.status}`}>
+      {setupJob && ["queued","running"].includes(setupJob.status) && <div className={`setupStatus ${setupJob.status}`}>
         <div className="progressHeader">
           <span>{setupJob.stage || setupJob.status}</span>
           <b>{setupJob.progress_percent ?? 0}%</b>
@@ -158,20 +158,28 @@ function App(){
         <div className="progressTrack">
           <div className="progressFill" style={{width:`${setupJob.progress_percent ?? 0}%`}}></div>
         </div>
-
-        {setupJob.status==="completed" && platform.ready && <>
-          <div className="good setupHeadline">AWS Resources Ready ✓</div>
-          <div className="small monoBlock">S3 bucket: {platform.bucket}</div>
-          <div className="small monoBlock">SageMaker role: {platform.role}</div>
-        </>}
-
-        {setupJob.status==="failed" && <>
-          <div className="bad setupHeadline">Setup Failed ✕</div>
-          <div className="small">{setupJob.logs?.slice(-1)[0]}</div>
-        </>}
       </div>}
 
-      {!setupJob && <p className="small">AWS resources are not set up yet.</p>}
+      {platform.ready && !(setupJob && ["queued","running"].includes(setupJob.status)) && <div className="setupStatus completed">
+        <div className="progressHeader">
+          <span>Ready</span>
+          <b>100%</b>
+        </div>
+        <div className="progressTrack">
+          <div className="progressFill" style={{width:"100%"}}></div>
+        </div>
+        <div className="good setupHeadline">AWS Resources Ready ✓</div>
+        <div className="small monoBlock">S3 bucket: {platform.bucket}</div>
+        <div className="small monoBlock">SageMaker role: {platform.role}</div>
+        <div className="small persistentNote">Recovered from Terraform/AWS state — survives browser refresh and backend restart.</div>
+      </div>}
+
+      {setupJob?.status==="failed" && !platform.ready && <div className="setupStatus failed">
+        <div className="bad setupHeadline">Setup Failed ✕</div>
+        <div className="small">{setupJob.logs?.slice(-1)[0]}</div>
+      </div>}
+
+      {!platform.ready && !setupJob && <p className="small">AWS resources are not set up yet.</p>}
     </section>
 
     <section className="card">

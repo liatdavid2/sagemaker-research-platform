@@ -169,3 +169,21 @@ AWS-dependent actions are disabled until setup is ready:
 - Download & Register to S3
 - Upload & Register Training Code
 - Run Training
+
+
+## Persistent AWS setup state
+
+The Platform status no longer depends on an in-memory setup job.
+
+On each refresh the backend recovers readiness from the Terraform outputs and
+verifies the S3 bucket and SageMaker IAM role still exist in AWS. The result is
+cached briefly to avoid repeatedly invoking Terraform on every UI poll.
+
+Therefore `AWS Resources Ready` survives:
+
+- browser refresh
+- reopening the UI
+- backend restart
+- `docker compose down` / `docker compose up`
+
+As long as the Terraform state and AWS resources still exist.

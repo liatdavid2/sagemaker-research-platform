@@ -61,3 +61,5 @@ summary{cursor:pointer;font-weight:700}
 .setupHeadline{font-weight:700;margin-top:10px}
 .monoBlock{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all;margin-top:4px}
 .warningText{color:#d9ad58;font-weight:600}
+
+.persistentNote{margin-top:8px;color:#7f8caf}
