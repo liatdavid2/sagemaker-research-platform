@@ -9,6 +9,7 @@ function App(){
   const [datasets,setDatasets]=useState([]);
   const [codes,setCodes]=useState([]);
   const [jobs,setJobs]=useState([]);
+  const [platform,setPlatform]=useState({ready:false,latest_setup_job:null,bucket:null,role:null});
 
   const [catalogKey,setCatalogKey]=useState("cifar10");
   const [publicVersion,setPublicVersion]=useState("v3");
@@ -39,8 +40,9 @@ function App(){
   const [trainingJobId,setTrainingJobId]=useState(null);
 
   async function refresh(){
-    const [cat,d,c,j]=await Promise.all([
-      fetch(`${API}/catalog`),fetch(`${API}/datasets`),fetch(`${API}/codes`),fetch(`${API}/jobs`)
+    const [cat,d,c,j,p]=await Promise.all([
+      fetch(`${API}/catalog`),fetch(`${API}/datasets`),fetch(`${API}/codes`),fetch(`${API}/jobs`),
+      fetch(`${API}/platform-status`)
     ]);
     if(cat.ok){const x=await cat.json();setCatalog(x.datasets||[])}
     if(d.ok){
@@ -52,6 +54,7 @@ function App(){
       if(!codeId&&x.codes?.length)setCodeId(x.codes[0].id);
     }
     if(j.ok)setJobs(await j.json());
+    if(p.ok)setPlatform(await p.json());
   }
 
   async function refreshEstimate(){
@@ -119,6 +122,7 @@ function App(){
   }
 
   const selectedDataset=datasets.find(d=>d.id===datasetId);
+  const setupJob=platform.latest_setup_job;
   const selectedCode=codes.find(c=>c.id===codeId);
   const datasetJob=jobs.find(j=>j.id===datasetJobId);
   const trainingJob=jobs.find(j=>j.id===trainingJobId);
@@ -134,14 +138,46 @@ function App(){
 
     <section className="card">
       <h2>1. Platform</h2>
-      <button onClick={()=>post("/setup")}>Setup AWS Resources</button>
-      <button className="danger" onClick={()=>confirm("Destroy AWS resources?")&&post("/destroy")}>Destroy AWS Resources</button>
-      <a className="linkButton" href="http://localhost:5050" target="_blank" rel="noreferrer">Open MLflow</a>
+
+      <div className="platformActions">
+        <button
+          onClick={()=>post("/setup")}
+          disabled={setupJob && ["queued","running"].includes(setupJob.status)}>
+          {setupJob && ["queued","running"].includes(setupJob.status) ? "Setting up AWS..." : "Setup AWS Resources"}
+        </button>
+        <button className="danger" onClick={()=>confirm("Destroy AWS resources?")&&post("/destroy")}>Destroy AWS Resources</button>
+        <a className="linkButton" href="http://localhost:5050" target="_blank" rel="noreferrer">Open MLflow</a>
+      </div>
+
+      {setupJob && <div className={`setupStatus ${setupJob.status}`}>
+        <div className="progressHeader">
+          <span>{setupJob.stage || setupJob.status}</span>
+          <b>{setupJob.progress_percent ?? 0}%</b>
+        </div>
+
+        <div className="progressTrack">
+          <div className="progressFill" style={{width:`${setupJob.progress_percent ?? 0}%`}}></div>
+        </div>
+
+        {setupJob.status==="completed" && platform.ready && <>
+          <div className="good setupHeadline">AWS Resources Ready ✓</div>
+          <div className="small monoBlock">S3 bucket: {platform.bucket}</div>
+          <div className="small monoBlock">SageMaker role: {platform.role}</div>
+        </>}
+
+        {setupJob.status==="failed" && <>
+          <div className="bad setupHeadline">Setup Failed ✕</div>
+          <div className="small">{setupJob.logs?.slice(-1)[0]}</div>
+        </>}
+      </div>}
+
+      {!setupJob && <p className="small">AWS resources are not set up yet.</p>}
     </section>
 
     <section className="card">
       <h2>2. Dataset Registry</h2>
       <p>Download a trusted public dataset once, register the exact archive in S3, and reuse that version.</p>
+      {!platform.ready && <p className="warningText">Complete Setup AWS Resources first.</p>}
 
       <div className="budgetGrid">
         <label>Dataset
@@ -153,7 +189,7 @@ function App(){
           <input value={publicVersion} onChange={e=>setPublicVersion(e.target.value)}/>
         </label>
         <div className="actionCell">
-          <button onClick={downloadDataset} disabled={datasetJob&&["queued","running"].includes(datasetJob.status)}>
+          <button onClick={downloadDataset} disabled={!platform.ready || (datasetJob&&["queued","running"].includes(datasetJob.status))}>
             Download & Register to S3
           </button>
         </div>
@@ -193,6 +229,7 @@ function App(){
     <section className="card">
       <h2>3. Training Code Registry</h2>
       <p>Researcher uploads a versioned ZIP containing <code>train.py</code>. The platform hashes it, stores it in S3, and uses that exact snapshot for SageMaker.</p>
+      {!platform.ready && <p className="warningText">Complete Setup AWS Resources first.</p>}
 
       <div className="budgetGrid">
         <label>Code name<input value={codeName} onChange={e=>setCodeName(e.target.value)}/></label>
@@ -209,7 +246,7 @@ function App(){
         <input type="file" accept=".zip" onChange={e=>setCodeFile(e.target.files[0])}/>
       </label>
 
-      <button onClick={uploadCode} disabled={codeUploading}>
+      <button onClick={uploadCode} disabled={!platform.ready || codeUploading}>
         {codeUploading ? "Uploading..." : "Upload & Register Training Code"}
       </button>
       {codeUploadMessage&&<span className="good inlineMessage">{codeUploadMessage}</span>}
@@ -323,7 +360,7 @@ Subset: ${useSubset ? `balanced · train ${trainMaxPerClass}/class · test ${tes
 MLflow: automatic`}</pre>
 
       <button className="runButton"
-        disabled={!datasetId||!codeId||(estimate&&!estimate.within_target)||trainingJob?.status==="running"}
+        disabled={!platform.ready||!datasetId||!codeId||(estimate&&!estimate.within_target)||trainingJob?.status==="running"}
         onClick={runTraining}>
         Run Training
       </button>

@@ -146,6 +146,30 @@ def estimate_budget(count, minutes, total_budget, planned_runs):
 def health():
     return {"ok": True, "project": "sagemaker-research-platform-full-ui"}
 
+
+@app.get("/api/platform-status")
+def platform_status():
+    setup_jobs = [j for j in jobs.values() if j.get("type") == "setup"]
+    latest = setup_jobs[-1] if setup_jobs else None
+
+    ready = False
+    bucket = None
+    role = None
+    if latest and latest.get("status") == "completed":
+        try:
+            bucket = terraform_output("artifact_bucket")
+            role = terraform_output("sagemaker_role_arn")
+            ready = bool(bucket and role)
+        except Exception:
+            ready = False
+
+    return {
+        "ready": ready,
+        "latest_setup_job": latest,
+        "bucket": bucket,
+        "role": role,
+    }
+
 @app.get("/api/catalog")
 def public_catalog():
     return {"datasets": list(PUBLIC_DATASETS.values())}
@@ -174,17 +198,46 @@ def list_jobs():
 @app.post("/api/setup")
 def setup():
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id": job_id, "type": "setup", "status": "queued", "logs": []}
+    jobs[job_id] = {
+        "id": job_id,
+        "type": "setup",
+        "status": "queued",
+        "logs": [],
+        "stage": "Queued",
+        "progress_percent": 0,
+    }
     launch(job_id, do_setup)
     return jobs[job_id]
 
 def do_setup(job_id):
+    jobs[job_id]["stage"] = "Checking AWS credentials"
+    jobs[job_id]["progress_percent"] = 10
     log(job_id, run_cmd(["aws", "sts", "get-caller-identity"]))
+
+    jobs[job_id]["stage"] = "Terraform init"
+    jobs[job_id]["progress_percent"] = 30
     log(job_id, run_cmd(["terraform", "init", "-input=false"], cwd=TF_DIR))
+
+    jobs[job_id]["stage"] = "Terraform validate"
+    jobs[job_id]["progress_percent"] = 45
     log(job_id, run_cmd(["terraform", "validate"], cwd=TF_DIR))
+
+    jobs[job_id]["stage"] = "Creating S3 + IAM"
+    jobs[job_id]["progress_percent"] = 65
     log(job_id, run_cmd(["terraform", "apply", "-auto-approve", "-input=false"], cwd=TF_DIR))
-    log(job_id, f"S3 bucket: {terraform_output('artifact_bucket')}")
-    log(job_id, f"SageMaker role: {terraform_output('sagemaker_role_arn')}")
+
+    jobs[job_id]["stage"] = "Verifying resources"
+    jobs[job_id]["progress_percent"] = 90
+    bucket = terraform_output("artifact_bucket")
+    role = terraform_output("sagemaker_role_arn")
+    jobs[job_id]["bucket"] = bucket
+    jobs[job_id]["role"] = role
+    log(job_id, f"S3 bucket: {bucket}")
+    log(job_id, f"SageMaker role: {role}")
+
+    jobs[job_id]["stage"] = "Ready"
+    jobs[job_id]["progress_percent"] = 100
+
 
 @app.post("/api/destroy")
 def destroy():

@@ -139,3 +139,33 @@ The UI shows:
 - ETA
 - S3 cache hit
 - local cache hit
+
+
+## Platform readiness in the UI
+
+`Setup AWS Resources` now reports explicit stages and progress:
+
+```text
+Checking AWS credentials
+Terraform init
+Terraform validate
+Creating S3 + IAM
+Verifying resources
+Ready
+```
+
+On success the UI shows:
+
+```text
+AWS Resources Ready ✓
+S3 bucket: ...
+SageMaker role: ...
+```
+
+On failure the UI shows the latest setup error.
+
+AWS-dependent actions are disabled until setup is ready:
+
+- Download & Register to S3
+- Upload & Register Training Code
+- Run Training
