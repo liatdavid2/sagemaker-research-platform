@@ -1,19 +1,23 @@
-import os, subprocess, threading, time, uuid, zipfile, shutil
+import hashlib
+import json
+import os
+import subprocess
+import threading
+import time
+import uuid
 from pathlib import Path
-from typing import Optional
 
 import boto3
+import mlflow
+import sagemaker
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sagemaker.inputs import TrainingInput
 
 ROOT = Path(os.getenv("PROJECT_ROOT", "/workspace"))
 TF_DIR = ROOT / "infra" / "terraform"
-UPLOADS = ROOT / ".local_runs"
-RESULTS = ROOT / "results"
-UPLOADS.mkdir(exist_ok=True)
-RESULTS.mkdir(exist_ok=True)
 
-app = FastAPI(title="SageMaker Research Platform API", version="4.0.0")
+app = FastAPI(title="SageMaker Reproducible Research Platform", version="6.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,24 +27,71 @@ app.add_middleware(
 )
 
 jobs = {}
+INSTANCE_TYPE = "ml.g4dn.xlarge"
+ALLOWED_COUNTS = {1, 2, 4}
+ALLOWED_FRAMEWORKS = {"pytorch", "tensorflow"}
+SPOT_ESTIMATE = float(os.getenv("ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR", "0.55"))
 
-ALLOWED_INSTANCE_COUNTS = {1, 2, 4}
-ALLOWED_INSTANCE_TYPE = "ml.g4dn.xlarge"
 
-# This is only a configurable planning estimate for the UI/backend budget guard.
-# It is NOT the AWS bill and it is intentionally conservative.
-DEFAULT_ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR = float(
-    os.getenv("ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR", "0.55")
-)
-
-def run_cmd(cmd, cwd=None, env=None):
-    p = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+def run_cmd(args, cwd=None):
+    p = subprocess.run(args, cwd=cwd, text=True, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError((p.stdout + "\n" + p.stderr).strip())
     return p.stdout.strip()
 
-def log(job_id, msg):
-    jobs[job_id]["logs"].append(str(msg))
+
+def terraform_output(name):
+    return run_cmd(["terraform", "output", "-raw", name], cwd=TF_DIR)
+
+
+def current_git_commit():
+    try:
+        return run_cmd(["git", "rev-parse", "HEAD"], cwd=ROOT)
+    except Exception:
+        return os.getenv("CODE_VERSION", "unknown")
+
+
+def git_dirty():
+    try:
+        return bool(run_cmd(["git", "status", "--porcelain"], cwd=ROOT))
+    except Exception:
+        return False
+
+
+def aws_region():
+    return os.getenv("AWS_DEFAULT_REGION", "eu-central-1")
+
+
+def s3_client():
+    return boto3.client("s3", region_name=aws_region())
+
+
+def registry_key():
+    return "dataset-registry/manifest.json"
+
+
+def load_registry():
+    try:
+        bucket = terraform_output("artifact_bucket")
+        obj = s3_client().get_object(Bucket=bucket, Key=registry_key())
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return {"datasets": []}
+
+
+def save_registry(registry):
+    bucket = terraform_output("artifact_bucket")
+    s3_client().put_object(
+        Bucket=bucket,
+        Key=registry_key(),
+        Body=json.dumps(registry, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def log(job_id, message):
+    jobs[job_id]["logs"].append(str(message))
+
 
 def launch(job_id, fn, *args):
     def wrapper():
@@ -49,39 +100,44 @@ def launch(job_id, fn, *args):
             fn(job_id, *args)
             if jobs[job_id]["status"] == "running":
                 jobs[job_id]["status"] = "completed"
-        except Exception as e:
-            log(job_id, f"ERROR: {e}")
+        except Exception as exc:
+            log(job_id, f"ERROR: {exc}")
             jobs[job_id]["status"] = "failed"
     threading.Thread(target=wrapper, daemon=True).start()
 
-def tf_output(name):
-    return run_cmd(["terraform", "output", "-raw", name], cwd=TF_DIR)
 
-def estimate_cost(instance_count: int, max_minutes: int):
-    hours = max_minutes / 60.0
-    return round(instance_count * hours * DEFAULT_ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR, 4)
-
-def validate_budget(instance_count: int, max_minutes: int, total_budget_usd: float, planned_runs: int):
-    if instance_count not in ALLOWED_INSTANCE_COUNTS:
-        raise HTTPException(400, "instance_count must be 1, 2 or 4")
-    if max_minutes < 1 or max_minutes > 60:
+def estimate_budget(count, minutes, total_budget, planned_runs):
+    if count not in ALLOWED_COUNTS:
+        raise HTTPException(400, "GPU workers must be 1, 2, or 4")
+    if not 1 <= minutes <= 60:
         raise HTTPException(400, "max_minutes must be between 1 and 60")
-    if total_budget_usd <= 0:
-        raise HTTPException(400, "total_budget_usd must be > 0")
-    if planned_runs < 1 or planned_runs > 100:
-        raise HTTPException(400, "planned_runs must be between 1 and 100")
+    if total_budget <= 0 or planned_runs < 1:
+        raise HTTPException(400, "Invalid budget configuration")
 
-    per_run_budget = total_budget_usd / planned_runs
-    estimated = estimate_cost(instance_count, max_minutes)
+    per_run = total_budget / planned_runs
+    estimated = count * (minutes / 60.0) * SPOT_ESTIMATE
     return {
-        "estimated_run_cost_usd": estimated,
-        "per_run_budget_usd": round(per_run_budget, 4),
-        "within_target": estimated <= per_run_budget,
+        "estimated_run_cost_usd": round(estimated, 4),
+        "per_run_budget_usd": round(per_run, 4),
+        "within_target": estimated <= per_run,
     }
+
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "project": "sagemaker-research-platform-budget"}
+    return {"ok": True, "project": "sagemaker-research-platform-reproducible"}
+
+
+@app.get("/api/code-version")
+def code_version():
+    commit = current_git_commit()
+    dirty = git_dirty()
+    return {
+        "git_commit": commit,
+        "dirty": dirty,
+        "reproducible": commit != "unknown" and not dirty,
+    }
+
 
 @app.get("/api/budget-estimate")
 def budget_estimate(
@@ -90,258 +146,227 @@ def budget_estimate(
     total_budget_usd: float = 1.0,
     planned_runs: int = 5,
 ):
-    return validate_budget(instance_count, max_minutes, total_budget_usd, planned_runs)
+    return estimate_budget(instance_count, max_minutes, total_budget_usd, planned_runs)
+
+
+@app.get("/api/datasets")
+def datasets():
+    return load_registry()
+
+
+@app.post("/api/datasets/upload")
+async def upload_dataset(
+    name: str = Form(...),
+    version: str = Form(...),
+    dataset: UploadFile = File(...),
+):
+    payload = await dataset.read()
+    sha256 = hashlib.sha256(payload).hexdigest()
+    bucket = terraform_output("artifact_bucket")
+
+    safe_name = name.strip().replace(" ", "-")
+    safe_version = version.strip().replace(" ", "-")
+    key = f"datasets/{safe_name}/{safe_version}/{dataset.filename}"
+
+    s3_client().put_object(Bucket=bucket, Key=key, Body=payload)
+
+    item = {
+        "id": f"{safe_name}:{safe_version}",
+        "name": name,
+        "version": version,
+        "filename": dataset.filename,
+        "s3_uri": f"s3://{bucket}/{key}",
+        "sha256": sha256,
+        "uploaded_at": int(time.time()),
+    }
+
+    registry = load_registry()
+    registry["datasets"] = [d for d in registry["datasets"] if d["id"] != item["id"]]
+    registry["datasets"].append(item)
+    save_registry(registry)
+    return item
+
 
 @app.get("/api/jobs")
 def list_jobs():
     return list(jobs.values())[::-1]
 
-@app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404, "Job not found")
-    return jobs[job_id]
 
 @app.post("/api/setup")
 def setup():
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id":job_id,"type":"setup","status":"queued","logs":[],"created_at":time.time()}
+    jobs[job_id] = {"id": job_id, "type": "setup", "status": "queued", "logs": []}
     launch(job_id, do_setup)
     return jobs[job_id]
 
+
 def do_setup(job_id):
-    log(job_id, "AWS identity:")
-    log(job_id, run_cmd(["aws","sts","get-caller-identity"]))
-    log(job_id, "Terraform init")
-    log(job_id, run_cmd(["terraform","init","-input=false"], cwd=TF_DIR))
-    log(job_id, "Terraform validate")
-    log(job_id, run_cmd(["terraform","validate"], cwd=TF_DIR))
-    log(job_id, "Creating S3 + IAM only (no GPU compute)")
-    log(job_id, run_cmd(["terraform","apply","-auto-approve","-input=false"], cwd=TF_DIR))
-    log(job_id, f"Bucket: {tf_output('artifact_bucket')}")
-    log(job_id, f"Role: {tf_output('sagemaker_role_arn')}")
+    log(job_id, run_cmd(["aws", "sts", "get-caller-identity"]))
+    log(job_id, run_cmd(["terraform", "init", "-input=false"], cwd=TF_DIR))
+    log(job_id, run_cmd(["terraform", "validate"], cwd=TF_DIR))
+    log(job_id, run_cmd(["terraform", "apply", "-auto-approve", "-input=false"], cwd=TF_DIR))
+    log(job_id, f"S3 bucket: {terraform_output('artifact_bucket')}")
+    log(job_id, f"SageMaker role: {terraform_output('sagemaker_role_arn')}")
+
 
 @app.post("/api/destroy")
 def destroy():
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id":job_id,"type":"destroy","status":"queued","logs":[],"created_at":time.time()}
+    jobs[job_id] = {"id": job_id, "type": "destroy", "status": "queued", "logs": []}
     launch(job_id, do_destroy)
     return jobs[job_id]
 
+
 def do_destroy(job_id):
-    log(job_id, "Destroying S3/IAM resources...")
-    log(job_id, run_cmd(["terraform","destroy","-auto-approve","-input=false"], cwd=TF_DIR))
-    log(job_id, "Destroy complete.")
+    log(job_id, run_cmd(["terraform", "destroy", "-auto-approve", "-input=false"], cwd=TF_DIR))
 
-def local_image(framework):
-    return {
-        "pytorch": "pytorch/pytorch:2.2.2-cpu",
-        "sklearn": "python:3.11-slim",
-        "tensorflow": "tensorflow/tensorflow:2.15.0"
-    }[framework]
 
-def do_local(job_id, framework, source_dir, dataset_path, max_minutes):
-    image = local_image(framework)
-    run_dir = source_dir.parent
-    model_dir = run_dir / "model"
-    model_dir.mkdir(exist_ok=True)
-
-    install = ""
-    if (source_dir/"requirements.txt").exists():
-        install = "pip install --no-cache-dir -r /job/requirements.txt && "
-
-    cmd = [
-        "docker","run","--rm",
-        "-v",f"{source_dir}:/job",
-        "-v",f"{model_dir}:/model",
-        "-e","LOCAL_MODEL_DIR=/model",
-        "-e","LOCAL_DATA_DIR=/data",
-    ]
-    if dataset_path:
-        data_dir = run_dir/"data"
-        data_dir.mkdir(exist_ok=True)
-        shutil.copy2(dataset_path, data_dir/dataset_path.name)
-        cmd += ["-v",f"{data_dir}:/data"]
-
-    # Keep local and cloud entrypoint behavior aligned.
-    cmd += [
-        image, "bash", "-lc",
-        f"timeout {max_minutes*60}s bash -lc '{install}python /job/train.py --epochs 1 --batch-size 64'"
-    ]
-
-    log(job_id, f"Local image: {image}")
-    log(job_id, f"Local time limit: {max_minutes} minute(s)")
-    start=time.time()
-    out=run_cmd(cmd)
-    elapsed=time.time()-start
-    log(job_id, out)
-    log(job_id, f"Local run completed in {elapsed:.1f}s")
-    jobs[job_id]["elapsed_seconds"]=round(elapsed,1)
-
-def framework_estimator(framework, source_dir, role, instance_count, output_path, max_minutes):
+def build_estimator(framework, source_dir, role, count, output, max_minutes, epochs, commit):
     from sagemaker.pytorch import PyTorch
     from sagemaker.tensorflow import TensorFlow
-    from sagemaker.sklearn.estimator import SKLearn
-
-    max_run_seconds = int(max_minutes * 60)
-    # Allow extra wait time for Managed Spot capacity, but not unlimited waiting.
-    max_wait_seconds = max_run_seconds + 300
 
     common = dict(
         entry_point="train.py",
         source_dir=str(source_dir),
         role=role,
-        instance_type=ALLOWED_INSTANCE_TYPE,
-        instance_count=instance_count,
-        output_path=output_path,
+        instance_type=INSTANCE_TYPE,
+        instance_count=count,
+        output_path=output,
         hyperparameters={
-            "epochs": 1,
+            "epochs": epochs,
             "batch-size": 64,
+            "git-commit": commit,
         },
         use_spot_instances=True,
-        max_run=max_run_seconds,
-        max_wait=max_wait_seconds,
+        max_run=max_minutes * 60,
+        max_wait=max_minutes * 60 + 300,
         disable_profiler=True,
     )
 
-    if framework=="pytorch":
-        return PyTorch(framework_version="2.2.0",py_version="py310",**common)
-    if framework=="tensorflow":
-        return TensorFlow(framework_version="2.15.0",py_version="py310",**common)
-    if framework=="sklearn":
-        return SKLearn(framework_version="1.2-1",py_version="py3",**common)
-    raise ValueError("Unsupported framework")
+    if framework == "pytorch":
+        return PyTorch(framework_version="2.2.0", py_version="py310", **common)
+    return TensorFlow(framework_version="2.15.0", py_version="py310", **common)
 
-def do_sagemaker(
-    job_id, framework, source_dir, dataset_path,
-    instance_count, max_minutes, total_budget_usd, planned_runs
-):
-    import sagemaker
-    from sagemaker.inputs import TrainingInput
-
-    budget = validate_budget(instance_count, max_minutes, total_budget_usd, planned_runs)
-    jobs[job_id]["budget"] = budget
-
-    bucket=tf_output("artifact_bucket")
-    role=tf_output("sagemaker_role_arn")
-    region=os.getenv("AWS_DEFAULT_REGION","eu-central-1")
-    session=boto3.Session(region_name=region)
-    sm_session=sagemaker.Session(boto_session=session, default_bucket=bucket)
-
-    inputs=None
-    if dataset_path:
-        key=f"datasets/{job_id}/{dataset_path.name}"
-        boto3.client("s3",region_name=region).upload_file(str(dataset_path),bucket,key)
-        uri=f"s3://{bucket}/{key}"
-        inputs={"training":TrainingInput(uri)}
-        log(job_id,f"Dataset uploaded to {uri}")
-
-    output=f"s3://{bucket}/outputs/{job_id}"
-    est=framework_estimator(
-        framework, source_dir, role, instance_count, output, max_minutes
-    )
-    est.sagemaker_session=sm_session
-
-    log(job_id, f"Budget target: ${total_budget_usd:.2f} total / {planned_runs} runs")
-    log(job_id, f"Per-run budget target: ${budget['per_run_budget_usd']:.2f}")
-    log(job_id, f"Planning estimate for this run: ${budget['estimated_run_cost_usd']:.2f}")
-    log(job_id, f"Managed Spot only; max training runtime: {max_minutes} minute(s)")
-    log(job_id, f"Starting SageMaker: {instance_count} x {ALLOWED_INSTANCE_TYPE} ({framework})")
-
-    start=time.time()
-    est.fit(inputs=inputs,wait=True,logs=True)
-    elapsed=time.time()-start
-
-    jobs[job_id]["elapsed_seconds"]=round(elapsed,1)
-    jobs[job_id]["output_path"]=output
-    log(job_id,f"SageMaker completed in {elapsed:.1f}s")
-    log(job_id,f"Artifacts: {output}")
-
-async def save_uploads(training_zip, dataset, job_id):
-    job_dir=UPLOADS/job_id
-    source=job_dir/"source"
-    source.mkdir(parents=True)
-    zpath=job_dir/"training.zip"
-    zpath.write_bytes(await training_zip.read())
-
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall(source)
-
-    if not (source/"train.py").exists():
-        dirs=[p for p in source.iterdir() if p.is_dir()]
-        if len(dirs)==1 and (dirs[0]/"train.py").exists():
-            source=dirs[0]
-
-    if not (source/"train.py").exists():
-        raise HTTPException(400,"ZIP must contain train.py")
-
-    dataset_path=None
-    if dataset:
-        dataset_path=job_dir/dataset.filename
-        dataset_path.write_bytes(await dataset.read())
-
-    return source,dataset_path
-
-@app.post("/api/run-local")
-async def run_local(
-    framework:str=Form(...),
-    max_minutes:int=Form(5),
-    training_zip:UploadFile=File(...),
-    dataset:Optional[UploadFile]=File(None),
-):
-    if framework not in ["pytorch","sklearn","tensorflow"]:
-        raise HTTPException(400,"Unsupported framework")
-    if max_minutes < 1 or max_minutes > 60:
-        raise HTTPException(400,"max_minutes must be between 1 and 60")
-
-    job_id=str(uuid.uuid4())
-    source,dataset_path=await save_uploads(training_zip,dataset,job_id)
-    jobs[job_id]={
-        "id":job_id,"type":"local","name":training_zip.filename,
-        "status":"queued","logs":[],"created_at":time.time()
-    }
-    launch(job_id,do_local,framework,source,dataset_path,max_minutes)
-    return jobs[job_id]
 
 @app.post("/api/run-sagemaker")
-async def run_sagemaker(
-    framework:str=Form(...),
-    instance_count:int=Form(1),
-    max_minutes:int=Form(5),
-    total_budget_usd:float=Form(1.0),
-    planned_runs:int=Form(5),
-    training_zip:UploadFile=File(...),
-    dataset:Optional[UploadFile]=File(None),
+def run_sagemaker(
+    framework: str = Form(...),
+    dataset_id: str = Form(...),
+    epochs: int = Form(1),
+    instance_count: int = Form(1),
+    max_minutes: int = Form(5),
+    total_budget_usd: float = Form(1.0),
+    planned_runs: int = Form(5),
 ):
-    if framework not in ["pytorch","sklearn","tensorflow"]:
-        raise HTTPException(400,"Unsupported framework")
+    if framework not in ALLOWED_FRAMEWORKS:
+        raise HTTPException(400, "Framework must be PyTorch or TensorFlow")
+    if not 1 <= epochs <= 50:
+        raise HTTPException(400, "epochs must be between 1 and 50")
+    if git_dirty():
+        raise HTTPException(400, "Commit current code changes before starting a reproducible run")
 
-    budget = validate_budget(instance_count, max_minutes, total_budget_usd, planned_runs)
+    budget = estimate_budget(instance_count, max_minutes, total_budget_usd, planned_runs)
     if not budget["within_target"]:
-        raise HTTPException(
-            400,
-            f"Estimated run cost ${budget['estimated_run_cost_usd']:.2f} "
-            f"exceeds per-run target ${budget['per_run_budget_usd']:.2f}. "
-            "Increase total budget, reduce planned runs, reduce runtime, or use fewer GPUs."
-        )
+        raise HTTPException(400, "Current configuration exceeds the per-run budget target")
 
-    job_id=str(uuid.uuid4())
-    source,dataset_path=await save_uploads(training_zip,dataset,job_id)
-    jobs[job_id]={
-        "id":job_id,"type":"sagemaker","name":training_zip.filename,
-        "status":"queued","logs":[],"created_at":time.time(),
-        "budget":budget
+    dataset = next((d for d in load_registry()["datasets"] if d["id"] == dataset_id), None)
+    if not dataset:
+        raise HTTPException(404, "Dataset version not found")
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "id": job_id,
+        "type": "sagemaker",
+        "framework": framework,
+        "dataset": dataset,
+        "epochs": epochs,
+        "instance_count": instance_count,
+        "instance_type": INSTANCE_TYPE,
+        "max_minutes": max_minutes,
+        "git_commit": current_git_commit(),
+        "git_dirty": False,
+        "budget": budget,
+        "status": "queued",
+        "logs": [],
+        "mlflow_run_id": None,
     }
-    launch(
-        job_id,do_sagemaker,framework,source,dataset_path,
-        instance_count,max_minutes,total_budget_usd,planned_runs
-    )
+    launch(job_id, do_sagemaker)
     return jobs[job_id]
 
-@app.post("/api/stop-sagemaker/{training_job_name}")
-def stop_sagemaker(training_job_name: str):
-    region=os.getenv("AWS_DEFAULT_REGION","eu-central-1")
-    boto3.client("sagemaker",region_name=region).stop_training_job(
-        TrainingJobName=training_job_name
+
+def parse_metrics(text):
+    metrics = {}
+    for line in str(text).splitlines():
+        if "METRICS" in line:
+            try:
+                metrics.update(json.loads(line.split("METRICS", 1)[1].strip()))
+            except Exception:
+                pass
+    return metrics
+
+
+def do_sagemaker(job_id):
+    job = jobs[job_id]
+    bucket = terraform_output("artifact_bucket")
+    role = terraform_output("sagemaker_role_arn")
+    session = boto3.Session(region_name=aws_region())
+    sm_session = sagemaker.Session(boto_session=session, default_bucket=bucket)
+
+    source_dir = ROOT / "examples" / (
+        "pytorch_vision" if job["framework"] == "pytorch" else "tensorflow_vision"
     )
-    return {"ok": True, "training_job_name": training_job_name}
+    output = f"s3://{bucket}/outputs/{job_id}"
+
+    estimator = build_estimator(
+        job["framework"], source_dir, role, job["instance_count"], output,
+        job["max_minutes"], job["epochs"], job["git_commit"]
+    )
+    estimator.sagemaker_session = sm_session
+
+    log(job_id, f"Dataset: {job['dataset']['name']}:{job['dataset']['version']}")
+    log(job_id, f"Dataset SHA256: {job['dataset']['sha256']}")
+    log(job_id, f"Code commit: {job['git_commit']}")
+    log(job_id, f"GPU: {job['instance_count']} x {INSTANCE_TYPE}")
+    log(job_id, f"Epochs: {job['epochs']}")
+    log(job_id, "Managed Spot: true")
+
+    # Create MLflow run automatically so every cloud execution is tracked.
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
+    mlflow.set_experiment("sagemaker-research-platform")
+
+    with mlflow.start_run(run_name=f"{job['framework']}-{job_id[:8]}") as active:
+        job["mlflow_run_id"] = active.info.run_id
+
+        mlflow.log_params({
+            "dataset_id": job["dataset"]["id"],
+            "dataset_sha256": job["dataset"]["sha256"],
+            "dataset_s3_uri": job["dataset"]["s3_uri"],
+            "git_commit": job["git_commit"],
+            "framework": job["framework"],
+            "epochs": job["epochs"],
+            "gpu_workers": job["instance_count"],
+            "instance_type": job["instance_type"],
+            "managed_spot": True,
+            "max_minutes": job["max_minutes"],
+        })
+        mlflow.log_metric("estimated_run_cost_usd", job["budget"]["estimated_run_cost_usd"])
+        mlflow.log_metric("per_run_budget_usd", job["budget"]["per_run_budget_usd"])
+
+        start = time.time()
+        estimator.fit(
+            inputs={"training": TrainingInput(job["dataset"]["s3_uri"])},
+            wait=True,
+            logs=True,
+        )
+        elapsed = time.time() - start
+
+        job["elapsed_seconds"] = round(elapsed, 2)
+        job["output_path"] = output
+
+        mlflow.log_metric("elapsed_seconds", job["elapsed_seconds"])
+        mlflow.set_tag("sagemaker_output_path", output)
+        mlflow.set_tag("reproducible", "true")
+
+    log(job_id, f"Completed in {job['elapsed_seconds']} sec")
+    log(job_id, f"MLflow run: {job['mlflow_run_id']}")
+    log(job_id, f"Artifacts: {output}")

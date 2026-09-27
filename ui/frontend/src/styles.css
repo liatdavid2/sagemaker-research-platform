@@ -16,3 +16,18 @@ pre{white-space:pre-wrap;background:#090e1a;border-radius:10px;padding:12px;over
 .status{padding:3px 8px;border-radius:999px;margin-left:8px;background:#38415b}.status.completed{background:#1f6a4a}.status.failed{background:#8a3340}.status.running{background:#725d18}
 code{color:#d7defc}
 @media(max-width:800px){.grid,.budgetGrid{grid-template-columns:1fr}header{flex-direction:column}}
+
+.linkButton{display:inline-block;background:#596fff;color:white;text-decoration:none;border-radius:9px;padding:11px 15px;font-weight:700;margin-top:5px}
+
+.miniLink{display:inline-block;color:#aab8ff;margin:7px 10px 7px 0;text-decoration:none;font-size:13px}
+.miniLink:hover{text-decoration:underline}
+
+
+.configSummary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:15px 0}
+.configSummary>div{background:#0c1325;border:1px solid #283451;border-radius:10px;padding:13px}
+.configSummary span{display:block;color:#8795ba;font-size:12px;margin-bottom:5px}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.datasetRow{padding:12px 0;border-top:1px solid #25304d}
+.heroRun{border-color:#5269ff}
+.runButton{font-size:16px;padding:13px 24px}
+.registry{margin-top:14px}

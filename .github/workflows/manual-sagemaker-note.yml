@@ -8,7 +8,7 @@ on:
         required: true
         default: pytorch
         type: choice
-        options: [pytorch, sklearn, tensorflow]
+        options: [pytorch, tensorflow]
       instance_count:
         description: GPU instance count
         required: true

@@ -19,8 +19,7 @@ jobs:
         run: |
           python -m py_compile ui/backend/app.py
           python -m py_compile examples/pytorch_vision/train.py
-          python -m py_compile examples/sklearn_tabular/train.py
-          python -m py_compile examples/tensorflow_tabular/train.py
+          python -m py_compile examples/tensorflow_vision/train.py
 
       - uses: hashicorp/setup-terraform@v3
         with:
