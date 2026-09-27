@@ -22,6 +22,8 @@ from sagemaker.inputs import TrainingInput
 
 ROOT = Path(os.getenv("PROJECT_ROOT", "/workspace"))
 TF_DIR = ROOT / "infra" / "terraform"
+FIXED_ARTIFACT_BUCKET = os.getenv("ARTIFACT_BUCKET", "sagemaker-research-platform-2fa2b53f")
+FIXED_SAGEMAKER_ROLE_NAME = os.getenv("SAGEMAKER_ROLE_NAME", "sagemaker-research-platform-2fa2b53f-execution")
 CACHE_DIR = ROOT / ".dataset_cache"
 CODE_CACHE = ROOT / ".code_cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -69,8 +71,39 @@ def run_cmd(args, cwd=None):
         raise RuntimeError((p.stdout + "\n" + p.stderr).strip())
     return p.stdout.strip()
 
-def terraform_output(name):
-    return run_cmd(["terraform", "output", "-raw", name], cwd=TF_DIR)
+def run_cmd_stream(job_id, args, cwd=None):
+    """Run a command and stream stdout/stderr line-by-line into the job console."""
+    log(job_id, "$ " + " ".join(str(x) for x in args))
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    captured = []
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.rstrip()
+        if line:
+            captured.append(line)
+            log(job_id, line)
+    rc = process.wait()
+    output = "\n".join(captured)
+    if rc != 0:
+        raise RuntimeError(output or f"Command failed with exit code {rc}")
+    return output
+
+def artifact_bucket():
+    return FIXED_ARTIFACT_BUCKET
+
+def sagemaker_role_arn():
+    explicit = os.getenv("SAGEMAKER_ROLE_ARN", "").strip()
+    if explicit:
+        return explicit
+    return boto3.client("iam").get_role(RoleName=FIXED_SAGEMAKER_ROLE_NAME)["Role"]["Arn"]
+
 
 def aws_region():
     return os.getenv("AWS_DEFAULT_REGION", "eu-central-1")
@@ -80,14 +113,14 @@ def s3_client():
 
 def load_json_from_s3(key, default):
     try:
-        bucket = terraform_output("artifact_bucket")
+        bucket = artifact_bucket()
         obj = s3_client().get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception:
         return default
 
 def save_json_to_s3(key, value):
-    bucket = terraform_output("artifact_bucket")
+    bucket = artifact_bucket()
     s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -122,7 +155,10 @@ def upsert_code(item):
     return item
 
 def log(job_id, message):
-    jobs[job_id]["logs"].append(str(message))
+    timestamp = time.strftime("%H:%M:%S")
+    text = str(message)
+    for line in text.splitlines() or [""]:
+        jobs[job_id]["logs"].append(f"[{timestamp}] {line}")
 
 def launch(job_id, fn, *args):
     def wrapper():
@@ -157,312 +193,73 @@ def health():
 
 
 def detect_platform_resources(force=False):
-    """
-    Persistent readiness check.
-    Does not depend on in-memory setup jobs, so browser refreshes and backend
-    restarts still recover the real AWS/Terraform state.
-    """
+    """Verify existing AWS resources only; never provision or destroy them."""
     now = time.time()
-    if (
-        not force
-        and now - platform_status_cache["checked_at"] < PLATFORM_STATUS_TTL_SECONDS
-    ):
+    if not force and now - platform_status_cache.get("checked_at", 0.0) < PLATFORM_STATUS_TTL_SECONDS:
         return dict(platform_status_cache)
 
     result = {
         "checked_at": now,
         "ready": False,
-        "bucket": None,
+        "storage_ready": False,
+        "training_ready": False,
+        "bucket": artifact_bucket(),
         "role": None,
         "error": None,
+        "role_error": None,
     }
 
     try:
-        bucket = terraform_output("artifact_bucket")
-        role = terraform_output("sagemaker_role_arn")
-
-        if not bucket or not role:
-            raise RuntimeError("Terraform outputs are not available yet")
-
-        # Verify that the resources still exist in AWS.
-        s3_client().head_bucket(Bucket=bucket)
-
-        role_name = role.rsplit("/", 1)[-1]
-        boto3.client("iam").get_role(RoleName=role_name)
-
-        result.update({
-            "ready": True,
-            "bucket": bucket,
-            "role": role,
-        })
+        s3_client().head_bucket(Bucket=result["bucket"])
+        result["storage_ready"] = True
+        result["ready"] = True
     except Exception as exc:
-        result["error"] = str(exc)
+        result["error"] = f"S3 bucket check failed: {exc}"
+        platform_status_cache.clear()
+        platform_status_cache.update(result)
+        return dict(platform_status_cache)
 
+    try:
+        result["role"] = sagemaker_role_arn()
+        result["training_ready"] = True
+    except Exception as exc:
+        result["role_error"] = f"SageMaker role check failed: {exc}"
+
+    platform_status_cache.clear()
     platform_status_cache.update(result)
     return dict(platform_status_cache)
 
 
 @app.get("/api/platform-status")
 def platform_status():
-    setup_jobs = [j for j in jobs.values() if j.get("type") == "setup"]
-    latest = setup_jobs[-1] if setup_jobs else None
-
     persistent = detect_platform_resources(force=False)
-
     return {
         "ready": persistent["ready"],
-        "latest_setup_job": latest,
+        "storage_ready": persistent.get("storage_ready", False),
+        "training_ready": persistent.get("training_ready", False),
+        "latest_setup_job": None,
         "bucket": persistent["bucket"],
-        "role": persistent["role"],
-        "detected_from_aws": True,
-        "check_error": persistent["error"],
+        "role": persistent.get("role"),
+        "mode": "existing-aws-resources",
+        "check_error": persistent.get("error"),
+        "role_error": persistent.get("role_error"),
     }
 
-@app.get("/api/catalog")
-def public_catalog():
-    return {"datasets": list(PUBLIC_DATASETS.values())}
-
-@app.get("/api/budget-estimate")
-def budget_estimate(
-    instance_count: int = 1,
-    max_minutes: int = 5,
-    total_budget_usd: float = 1.0,
-    planned_runs: int = 5,
-):
-    return estimate_budget(instance_count, max_minutes, total_budget_usd, planned_runs)
-
-@app.get("/api/datasets")
-def datasets():
-    return load_dataset_registry()
-
-@app.get("/api/codes")
-def codes():
-    return load_code_registry()
-
-@app.get("/api/jobs")
-def list_jobs():
-    return list(jobs.values())[::-1]
 
 @app.post("/api/setup")
 def setup():
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "id": job_id,
-        "type": "setup",
-        "status": "queued",
-        "logs": [],
-        "stage": "Queued",
-        "progress_percent": 0,
-    }
-    launch(job_id, do_setup)
-    return jobs[job_id]
-
-def do_setup(job_id):
-    jobs[job_id]["stage"] = "Checking AWS credentials"
-    jobs[job_id]["progress_percent"] = 10
-    log(job_id, run_cmd(["aws", "sts", "get-caller-identity"]))
-
-    jobs[job_id]["stage"] = "Terraform init"
-    jobs[job_id]["progress_percent"] = 30
-    log(job_id, run_cmd(["terraform", "init", "-input=false"], cwd=TF_DIR))
-
-    jobs[job_id]["stage"] = "Terraform validate"
-    jobs[job_id]["progress_percent"] = 45
-    log(job_id, run_cmd(["terraform", "validate"], cwd=TF_DIR))
-
-    jobs[job_id]["stage"] = "Creating S3 + IAM"
-    jobs[job_id]["progress_percent"] = 65
-    log(job_id, run_cmd(["terraform", "apply", "-auto-approve", "-input=false"], cwd=TF_DIR))
-
-    jobs[job_id]["stage"] = "Verifying resources"
-    jobs[job_id]["progress_percent"] = 90
-    bucket = terraform_output("artifact_bucket")
-    role = terraform_output("sagemaker_role_arn")
-    jobs[job_id]["bucket"] = bucket
-    jobs[job_id]["role"] = role
-    log(job_id, f"S3 bucket: {bucket}")
-    log(job_id, f"SageMaker role: {role}")
-
-    jobs[job_id]["stage"] = "Ready"
-    jobs[job_id]["progress_percent"] = 100
-    detect_platform_resources(force=True)
+    raise HTTPException(
+        status_code=409,
+        detail="AWS infrastructure is managed outside the UI. Existing resources are used.",
+    )
 
 
 @app.post("/api/destroy")
 def destroy():
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id": job_id, "type": "destroy", "status": "queued", "logs": []}
-    launch(job_id, do_destroy)
-    return jobs[job_id]
-
-def do_destroy(job_id):
-    log(job_id, run_cmd(["terraform", "destroy", "-auto-approve", "-input=false"], cwd=TF_DIR))
-    platform_status_cache.update({
-        "checked_at": time.time(),
-        "ready": False,
-        "bucket": None,
-        "role": None,
-        "error": None,
-    })
-
-
-def registry_find_dataset(name, version):
-    safe_name = name.strip().lower().replace(" ", "-")
-    safe_version = version.strip().replace(" ", "-")
-    target_id = f"{safe_name}:{safe_version}"
-    return next((d for d in load_dataset_registry()["datasets"] if d["id"] == target_id), None)
-
-
-def s3_object_exists(s3_uri):
-    try:
-        bucket = s3_uri.split("/", 3)[2]
-        key = s3_uri.split("/", 3)[3]
-        s3_client().head_object(Bucket=bucket, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def file_sha256(path):
-    sha = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            sha.update(chunk)
-    return sha.hexdigest()
-
-
-def probe_range_support(url):
-    """
-    Returns (supports_ranges, total_size).
-    Tries HEAD first, then a 0-0 byte request if needed.
-    """
-    total = 0
-    try:
-        req = urllib.request.Request(
-            url,
-            method="HEAD",
-            headers={"User-Agent": "sagemaker-research-platform/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            accepts = (resp.headers.get("Accept-Ranges") or "").lower()
-            if "bytes" in accepts:
-                return True, total
-    except Exception:
-        pass
-
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "sagemaker-research-platform/1.0",
-                "Range": "bytes=0-0",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            status = getattr(resp, "status", None)
-            content_range = resp.headers.get("Content-Range") or ""
-            if status == 206 and "/" in content_range:
-                total = int(content_range.split("/")[-1])
-                return True, total
-    except Exception:
-        pass
-
-    return False, total
-
-
-def parallel_download(url, target_path, job_id, connections=4):
-    supports_ranges, total = probe_range_support(url)
-    jobs[job_id]["download_mode"] = (
-        f"Parallel ({connections} connections)" if supports_ranges and total > 0 else "Standard"
+    raise HTTPException(
+        status_code=409,
+        detail="AWS infrastructure destroy is disabled in this application.",
     )
-    jobs[job_id]["total_bytes"] = total
-
-    if not supports_ranges or total <= 0:
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "sagemaker-research-platform/1.0"},
-        )
-        started = time.time()
-        downloaded = 0
-        with urllib.request.urlopen(request, timeout=120) as response:
-            if not total:
-                total = int(response.headers.get("Content-Length") or 0)
-                jobs[job_id]["total_bytes"] = total
-            with open(target_path, "wb") as out:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    downloaded += len(chunk)
-                    jobs[job_id]["downloaded_bytes"] = downloaded
-                    if total > 0:
-                        jobs[job_id]["progress_percent"] = min(90, max(1, int(downloaded / total * 90)))
-                    elapsed = max(time.time() - started, 0.001)
-                    jobs[job_id]["speed_bps"] = downloaded / elapsed
-                    if total > downloaded and jobs[job_id]["speed_bps"] > 0:
-                        jobs[job_id]["eta_seconds"] = int((total - downloaded) / jobs[job_id]["speed_bps"])
-        return
-
-    # Parallel range download.
-    part_dir = target_path.parent / f"{target_path.name}.parts"
-    if part_dir.exists():
-        shutil.rmtree(part_dir)
-    part_dir.mkdir(parents=True)
-
-    chunk = total // connections
-    ranges = []
-    for i in range(connections):
-        start = i * chunk
-        end = total - 1 if i == connections - 1 else ((i + 1) * chunk - 1)
-        ranges.append((i, start, end))
-
-    progress = {"bytes": 0}
-    progress_lock = threading.Lock()
-    started = time.time()
-
-    def download_part(item):
-        idx, start, end = item
-        part_path = part_dir / f"part-{idx:02d}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "sagemaker-research-platform/1.0",
-                "Range": f"bytes={start}-{end}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=120) as response, open(part_path, "wb") as out:
-            while True:
-                data = response.read(1024 * 1024)
-                if not data:
-                    break
-                out.write(data)
-                with progress_lock:
-                    progress["bytes"] += len(data)
-                    downloaded = progress["bytes"]
-                    jobs[job_id]["downloaded_bytes"] = downloaded
-                    jobs[job_id]["progress_percent"] = min(90, max(1, int(downloaded / total * 90)))
-                    elapsed = max(time.time() - started, 0.001)
-                    speed = downloaded / elapsed
-                    jobs[job_id]["speed_bps"] = speed
-                    jobs[job_id]["eta_seconds"] = int((total - downloaded) / speed) if speed > 0 else None
-        return idx, part_path
-
-    parts = {}
-    try:
-        with ThreadPoolExecutor(max_workers=connections) as executor:
-            futures = [executor.submit(download_part, r) for r in ranges]
-            for future in as_completed(futures):
-                idx, path = future.result()
-                parts[idx] = path
-
-        with open(target_path, "wb") as merged:
-            for idx in range(connections):
-                with open(parts[idx], "rb") as part:
-                    shutil.copyfileobj(part, merged)
-    finally:
-        shutil.rmtree(part_dir, ignore_errors=True)
 
 
 @app.post("/api/datasets/register-public")
@@ -491,7 +288,7 @@ def register_public_dataset(catalog_key: str = Form(...), version: str = Form(..
     return jobs[job_id]
 
 def do_register_public_dataset(job_id, preset, version):
-    bucket = terraform_output("artifact_bucket")
+    bucket = artifact_bucket()
     safe_name = preset["name"].lower().replace(" ", "-")
     safe_version = version.strip().replace(" ", "-")
     local_path = CACHE_DIR / preset["filename"]
@@ -499,6 +296,7 @@ def do_register_public_dataset(job_id, preset, version):
     # 1) Check S3/registry first.
     jobs[job_id]["stage"] = "Checking S3"
     jobs[job_id]["progress_percent"] = 2
+    log(job_id, f"Checking registry and S3 for {preset['name']}:{version}...")
     existing = registry_find_dataset(preset["name"], version)
     if existing and s3_object_exists(existing["s3_uri"]):
         jobs[job_id]["cache_hit"] = "s3"
@@ -517,6 +315,7 @@ def do_register_public_dataset(job_id, preset, version):
         jobs[job_id]["download_mode"] = "Local cache"
         jobs[job_id]["stage"] = "Using local cache"
         jobs[job_id]["progress_percent"] = 90
+        log(job_id, "Local cached archive found; internet download will be skipped.")
         jobs[job_id]["downloaded_bytes"] = local_path.stat().st_size
         jobs[job_id]["total_bytes"] = local_path.stat().st_size
         log(job_id, f"Using cached file {local_path.name}")
@@ -525,20 +324,26 @@ def do_register_public_dataset(job_id, preset, version):
         jobs[job_id]["cache_hit"] = None
         jobs[job_id]["stage"] = "Downloading"
         jobs[job_id]["progress_percent"] = 1
+        log(job_id, f"Starting download: {preset['source_url']}")
         log(job_id, f"Downloading {preset['name']} from official public source")
         parallel_download(preset["source_url"], local_path, job_id, connections=4)
 
     jobs[job_id]["stage"] = "Hashing"
     jobs[job_id]["progress_percent"] = 92
+    log(job_id, "Computing SHA256...")
     sha256 = file_sha256(local_path)
+    log(job_id, f"SHA256: {sha256}")
 
     key = f"datasets/{safe_name}/{safe_version}/{preset['filename']}"
     jobs[job_id]["stage"] = "Uploading to S3"
     jobs[job_id]["progress_percent"] = 95
+    log(job_id, f"Uploading to s3://{bucket}/{key} ...")
     s3_client().upload_file(str(local_path), bucket, key)
+    log(job_id, "S3 upload completed.")
 
     jobs[job_id]["stage"] = "Registering"
     jobs[job_id]["progress_percent"] = 98
+    log(job_id, "Writing immutable dataset registry metadata...")
     item = {
         "id": f"{safe_name}:{safe_version}",
         "name": preset["name"],
@@ -556,6 +361,7 @@ def do_register_public_dataset(job_id, preset, version):
     jobs[job_id]["dataset"] = item
     jobs[job_id]["stage"] = "Registered"
     jobs[job_id]["progress_percent"] = 100
+    log(job_id, f"Registered {preset['name']}:{version} successfully.")
     if not jobs[job_id]["total_bytes"]:
         jobs[job_id]["total_bytes"] = local_path.stat().st_size
     jobs[job_id]["downloaded_bytes"] = jobs[job_id]["total_bytes"]
@@ -566,7 +372,7 @@ def do_register_public_dataset(job_id, preset, version):
 async def upload_dataset(name: str = Form(...), version: str = Form(...), dataset: UploadFile = File(...)):
     payload = await dataset.read()
     sha256 = hashlib.sha256(payload).hexdigest()
-    bucket = terraform_output("artifact_bucket")
+    bucket = artifact_bucket()
     safe_name = name.strip().replace(" ", "-")
     safe_version = version.strip().replace(" ", "-")
     key = f"datasets/{safe_name}/{safe_version}/{dataset.filename}"
@@ -614,7 +420,7 @@ async def upload_code(
             else:
                 raise HTTPException(400, "ZIP must contain train.py")
 
-    bucket = terraform_output("artifact_bucket")
+    bucket = artifact_bucket()
     safe_name = name.strip().replace(" ", "-")
     safe_version = version.strip().replace(" ", "-")
     key = f"training-code/{safe_name}/{safe_version}/{code_zip.filename}"
@@ -744,8 +550,8 @@ def run_sagemaker(
 
 def do_sagemaker(job_id):
     job = jobs[job_id]
-    bucket = terraform_output("artifact_bucket")
-    role = terraform_output("sagemaker_role_arn")
+    bucket = artifact_bucket()
+    role = sagemaker_role_arn()
     session = boto3.Session(region_name=aws_region())
     sm_session = sagemaker.Session(boto_session=session, default_bucket=bucket)
 

@@ -187,3 +187,29 @@ Therefore `AWS Resources Ready` survives:
 - `docker compose down` / `docker compose up`
 
 As long as the Terraform state and AWS resources still exist.
+
+
+## Live UI console
+
+The UI now exposes backend activity directly in the browser:
+
+- Setup Console streams AWS CLI and Terraform output line-by-line.
+- Dataset Console shows S3 lookup, cache/download, SHA256, upload and registration stages.
+- Activity Console shows the latest job and automatically refreshes with the existing polling loop.
+- Dataset registration shows `Starting...` immediately after the button is clicked.
+
+This avoids having to open Docker logs just to understand what the platform is doing.
+
+
+## Existing AWS resources mode
+
+This version does not provision or destroy AWS infrastructure from the UI.
+
+Existing S3 bucket:
+`sagemaker-research-platform-2fa2b53f`
+
+Existing SageMaker role name:
+`sagemaker-research-platform-2fa2b53f-execution`
+
+Dataset Registry and Training Code Registry upload directly to the existing S3 bucket.
+The UI only verifies access. Training uses the existing SageMaker IAM role.

@@ -5,9 +5,9 @@ services:
       dockerfile: ui/backend/Dockerfile
     container_name: sagemaker-research-platform-backend
     ports:
-      - "7474:8000"
+    - 7474:8000
     volumes:
-      - ./:/workspace
+    - ./:/workspace
     environment:
       PROJECT_ROOT: /workspace
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
@@ -16,26 +16,25 @@ services:
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-central-1}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR: ${ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR:-0.55}
+      ARTIFACT_BUCKET: sagemaker-research-platform-2fa2b53f
+      SAGEMAKER_ROLE_NAME: sagemaker-research-platform-2fa2b53f-execution
     depends_on:
-      - mlflow
-
+    - mlflow
   frontend:
     build:
       context: ./ui/frontend
     container_name: sagemaker-research-platform-frontend
     ports:
-      - "7475:80"
+    - 7475:80
     depends_on:
-      - backend
-
+    - backend
   mlflow:
     build:
       context: ./mlflow
     container_name: sagemaker-research-platform-mlflow
     ports:
-      - "5050:5000"
+    - 5050:5000
     volumes:
-      - mlflow_data:/mlflow
-
+    - mlflow_data:/mlflow
 volumes:
-  mlflow_data:
+  mlflow_data: null

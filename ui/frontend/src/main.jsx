@@ -14,6 +14,7 @@ function App(){
   const [catalogKey,setCatalogKey]=useState("cifar10");
   const [publicVersion,setPublicVersion]=useState("v3");
   const [datasetJobId,setDatasetJobId]=useState(null);
+  const [datasetStarting,setDatasetStarting]=useState(false);
 
   const [codeName,setCodeName]=useState("vision-cnn");
   const [codeVersion,setCodeVersion]=useState("v1");
@@ -71,19 +72,27 @@ function App(){
   async function post(path){
     const r=await fetch(`${API}${path}`,{method:"POST"});
     const body=await r.json();
-    if(!r.ok)alert(body.detail||JSON.stringify(body));
-    refresh();
+    if(!r.ok){alert(body.detail||JSON.stringify(body));return null}
+    await refresh();
+    return body;
   }
 
   async function downloadDataset(){
-    const fd=new FormData();
-    fd.append("catalog_key",catalogKey);
-    fd.append("version",publicVersion);
-    const r=await fetch(`${API}/datasets/register-public`,{method:"POST",body:fd});
-    const body=await r.json();
-    if(!r.ok){alert(body.detail||JSON.stringify(body));return}
-    setDatasetJobId(body.id);
-    refresh();
+    setDatasetStarting(true);
+    try{
+      const fd=new FormData();
+      fd.append("catalog_key",catalogKey);
+      fd.append("version",publicVersion);
+      const r=await fetch(`${API}/datasets/register-public`,{method:"POST",body:fd});
+      const body=await r.json();
+      if(!r.ok){alert(body.detail||JSON.stringify(body));return}
+      setDatasetJobId(body.id);
+      await refresh();
+    }catch(err){
+      alert(`Could not start dataset registration: ${err}`);
+    }finally{
+      setDatasetStarting(false);
+    }
   }
 
   async function uploadCode(){
@@ -122,10 +131,11 @@ function App(){
   }
 
   const selectedDataset=datasets.find(d=>d.id===datasetId);
-  const setupJob=platform.latest_setup_job;
+  const setupJob=null;
   const selectedCode=codes.find(c=>c.id===codeId);
-  const datasetJob=jobs.find(j=>j.id===datasetJobId);
-  const trainingJob=jobs.find(j=>j.id===trainingJobId);
+  const datasetJob=jobs.find(j=>j.id===datasetJobId) || jobs.find(j=>j.type==="dataset-download");
+  const trainingJob=jobs.find(j=>j.id===trainingJobId) || jobs.find(j=>j.type==="sagemaker-training");
+  const latestConsoleJob = datasetJob || trainingJob || jobs[0];
 
   return <main>
     <header>
@@ -137,55 +147,34 @@ function App(){
     </header>
 
     <section className="card">
-      <h2>1. Platform</h2>
+      <h2>1. AWS Connection</h2>
+      <p>Uses existing AWS resources. This UI does not create or destroy S3 buckets or IAM roles.</p>
 
       <div className="platformActions">
-        <button
-          onClick={()=>post("/setup")}
-          disabled={setupJob && ["queued","running"].includes(setupJob.status)}>
-          {setupJob && ["queued","running"].includes(setupJob.status) ? "Setting up AWS..." : "Setup AWS Resources"}
-        </button>
-        <button className="danger" onClick={()=>confirm("Destroy AWS resources?")&&post("/destroy")}>Destroy AWS Resources</button>
         <a className="linkButton" href="http://localhost:5050" target="_blank" rel="noreferrer">Open MLflow</a>
       </div>
 
-      {setupJob && ["queued","running"].includes(setupJob.status) && <div className={`setupStatus ${setupJob.status}`}>
-        <div className="progressHeader">
-          <span>{setupJob.stage || setupJob.status}</span>
-          <b>{setupJob.progress_percent ?? 0}%</b>
-        </div>
-
-        <div className="progressTrack">
-          <div className="progressFill" style={{width:`${setupJob.progress_percent ?? 0}%`}}></div>
-        </div>
-      </div>}
-
-      {platform.ready && !(setupJob && ["queued","running"].includes(setupJob.status)) && <div className="setupStatus completed">
-        <div className="progressHeader">
-          <span>Ready</span>
-          <b>100%</b>
-        </div>
-        <div className="progressTrack">
-          <div className="progressFill" style={{width:"100%"}}></div>
-        </div>
-        <div className="good setupHeadline">AWS Resources Ready ✓</div>
+      {platform.storage_ready ? <div className="setupStatus completed">
+        <div className="progressHeader"><span>Existing S3 connected</span><b>✓</b></div>
+        <div className="good setupHeadline">AWS Storage Ready ✓</div>
         <div className="small monoBlock">S3 bucket: {platform.bucket}</div>
-        <div className="small monoBlock">SageMaker role: {platform.role}</div>
-        <div className="small persistentNote">Recovered from Terraform/AWS state — survives browser refresh and backend restart.</div>
+        <div className="small persistentNote">
+          Fixed bucket — Dataset Registry and Training Code Registry only upload/read artifacts here.
+        </div>
+        {platform.training_ready
+          ? <div className="small monoBlock">SageMaker role: {platform.role}</div>
+          : <div className="warningText">S3 is connected. SageMaker IAM role could not be verified; uploads still work.</div>}
+      </div> : <div className="setupStatus failed">
+        <div className="bad setupHeadline">Cannot access existing S3 bucket</div>
+        <div className="small monoBlock">Expected bucket: {platform.bucket || "sagemaker-research-platform-2fa2b53f"}</div>
+        <div className="small">{platform.check_error}</div>
       </div>}
-
-      {setupJob?.status==="failed" && !platform.ready && <div className="setupStatus failed">
-        <div className="bad setupHeadline">Setup Failed ✕</div>
-        <div className="small">{setupJob.logs?.slice(-1)[0]}</div>
-      </div>}
-
-      {!platform.ready && !setupJob && <p className="small">AWS resources are not set up yet.</p>}
     </section>
 
     <section className="card">
       <h2>2. Dataset Registry</h2>
       <p>Download a trusted public dataset once, register the exact archive in S3, and reuse that version.</p>
-      {!platform.ready && <p className="warningText">Complete Setup AWS Resources first.</p>}
+      {!platform.storage_ready && <p className="warningText">Cannot access the configured S3 bucket.</p>}
 
       <div className="budgetGrid">
         <label>Dataset
@@ -197,8 +186,8 @@ function App(){
           <input value={publicVersion} onChange={e=>setPublicVersion(e.target.value)}/>
         </label>
         <div className="actionCell">
-          <button onClick={downloadDataset} disabled={!platform.ready || (datasetJob&&["queued","running"].includes(datasetJob.status))}>
-            Download & Register to S3
+          <button onClick={downloadDataset} disabled={!platform.storage_ready || datasetStarting || (datasetJob&&["queued","running"].includes(datasetJob.status))}>
+            {datasetStarting ? "Starting..." : (datasetJob&&["queued","running"].includes(datasetJob.status) ? "Working..." : "Download & Register to S3")}
           </button>
         </div>
       </div>
@@ -224,6 +213,18 @@ function App(){
         {datasetJob.cache_hit==="local" && <div className="good">Local cache hit — internet download skipped.</div>}
         {datasetJob.cache_hit==="s3" && <div className="good">Already registered in S3 — download and upload skipped.</div>}
         {datasetJob.status==="failed"&&<div className="bad">{datasetJob.logs?.slice(-1)[0]}</div>}
+        <div className="consoleWrap">
+          <div className="consoleTitle">Dataset Console</div>
+          <pre className="liveConsole">{(datasetJob.logs||[]).slice(-100).join("\n") || "Waiting for backend output..."}</pre>
+        </div>
+      </div>}
+
+      {datasetStarting && !datasetJob && <div className="inlineProgress">
+        <div className="progressHeader"><span>Sending request to backend...</span><b>0%</b></div>
+        <div className="consoleWrap">
+          <div className="consoleTitle">Dataset Console</div>
+          <pre className="liveConsole">Starting dataset registration request...</pre>
+        </div>
       </div>}
 
       <div className="registry">
@@ -237,7 +238,7 @@ function App(){
     <section className="card">
       <h2>3. Training Code Registry</h2>
       <p>Researcher uploads a versioned ZIP containing <code>train.py</code>. The platform hashes it, stores it in S3, and uses that exact snapshot for SageMaker.</p>
-      {!platform.ready && <p className="warningText">Complete Setup AWS Resources first.</p>}
+      {!platform.storage_ready && <p className="warningText">Cannot access the configured S3 bucket.</p>}
 
       <div className="budgetGrid">
         <label>Code name<input value={codeName} onChange={e=>setCodeName(e.target.value)}/></label>
@@ -254,7 +255,7 @@ function App(){
         <input type="file" accept=".zip" onChange={e=>setCodeFile(e.target.files[0])}/>
       </label>
 
-      <button onClick={uploadCode} disabled={!platform.ready || codeUploading}>
+      <button onClick={uploadCode} disabled={!platform.storage_ready || codeUploading}>
         {codeUploading ? "Uploading..." : "Upload & Register Training Code"}
       </button>
       {codeUploadMessage&&<span className="good inlineMessage">{codeUploadMessage}</span>}
@@ -368,7 +369,7 @@ Subset: ${useSubset ? `balanced · train ${trainMaxPerClass}/class · test ${tes
 MLflow: automatic`}</pre>
 
       <button className="runButton"
-        disabled={!platform.ready||!datasetId||!codeId||(estimate&&!estimate.within_target)||trainingJob?.status==="running"}
+        disabled={!platform.training_ready||!datasetId||!codeId||(estimate&&!estimate.within_target)||trainingJob?.status==="running"}
         onClick={runTraining}>
         Run Training
       </button>
@@ -379,6 +380,18 @@ MLflow: automatic`}</pre>
         {trainingJob.elapsed_seconds&&<div className="small">Elapsed: {trainingJob.elapsed_seconds}s</div>}
         {trainingJob.status==="failed"&&<div className="bad">{trainingJob.logs?.slice(-1)[0]}</div>}
       </div>}
+    </section>
+    <section className="card">
+      <h2>Activity Console</h2>
+      <p className="small">Live backend activity for the most recent job. Refreshes automatically.</p>
+      {latestConsoleJob ? <>
+        <div className="consoleMeta">
+          <span><b>Type:</b> {latestConsoleJob.type}</span>
+          <span><b>Status:</b> {latestConsoleJob.status}</span>
+          {latestConsoleJob.stage && <span><b>Stage:</b> {latestConsoleJob.stage}</span>}
+        </div>
+        <pre className="liveConsole globalConsole">{(latestConsoleJob.logs||[]).slice(-150).join("\n") || "Job started. Waiting for output..."}</pre>
+      </> : <pre className="liveConsole">No activity yet.</pre>}
     </section>
   </main>
 }
