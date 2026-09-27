@@ -1,33 +1,32 @@
-# SageMaker Research Platform — Reproducible ML + MLflow
+# SageMaker Research Platform — Full UI Reproducible Workflow
 
-This version is structured like an internal ML platform rather than a file-upload demo.
+The complete researcher workflow is now handled in the React UI.
 
-## Researcher flow
-
-```text
-Dataset:      CIFAR-10-v3
-Code version: git commit 8ac72f
-GPU:          g4dn.xlarge
-Epochs:       5
-
-[ Run Training ]
-```
-
-Flow:
+## UI flow
 
 ```text
-React UI
-   ↓
-Dataset Registry in S3
-   ↓
-Select dataset version + training parameters
-   ↓
-Validate committed Git version + budget
-   ↓
-Start SageMaker Managed Spot Training Job
-   ↓
-Automatically track the run in MLflow
+1. Setup AWS Resources
+2. Dataset Registry
+   - Download CIFAR-10 from trusted public source
+   - Live progress beside "Download & Register to S3"
+   - Store exact archive + SHA256 in S3
+3. Training Code Registry
+   - Researcher uploads training-code.zip
+   - Must contain train.py
+   - Store exact ZIP + SHA256 in S3
+4. Training Configuration
+   - Select dataset version
+   - Select training code version
+   - Framework
+   - Epochs
+   - 1 / 2 / 4 GPU workers
+5. Budget Guardrail
+6. Run Training
+   - SageMaker Managed Spot
+   - MLflow automatic
 ```
+
+There is no Run History section in this version.
 
 ## Local services
 
@@ -37,85 +36,106 @@ Backend   http://localhost:7474
 MLflow    http://localhost:5050
 ```
 
-Prometheus and Grafana are removed. Loki is also removed in this focused version.
-
 ## Reproducibility
 
-Every cloud run records:
+Each training run is tied to:
 
-- dataset logical name and version
-- dataset SHA256 content hash
-- exact S3 URI
-- exact Git commit
+- dataset ID/version
+- dataset SHA256
+- dataset S3 URI
+- training code ID/version
+- training code SHA256
+- training code S3 URI
 - framework
 - epochs
-- 1 / 2 / 4 GPU workers
-- fixed instance type `ml.g4dn.xlarge`
-- Managed Spot
-- maximum runtime
+- GPU worker count
+- fixed instance type
+- runtime guardrail
 - budget estimate
 - SageMaker output path
 - MLflow run ID
 
-The UI blocks training when the Git working tree has uncommitted changes.
-
-## Dataset Registry
-
-Researchers upload a dataset once with:
+## Training code ZIP
 
 ```text
-Name: CIFAR-10
-Version: v3
-File: ...
+training-code.zip
+├── train.py             required
+├── requirements.txt     optional
+├── config.yaml          optional
+└── README.md            optional
 ```
 
-The backend stores it in S3 and adds it to a versioned registry manifest.
-Subsequent experiments select that dataset version instead of choosing arbitrary files.
+The backend validates `train.py` before registering the code.
 
-## MLflow
-
-MLflow is automatic for SageMaker runs. A run is created when cloud training starts, so the configuration is captured even before training completes.
-
-Tracked values include dataset ID/hash, Git commit, framework, epochs, GPU workers, instance type, runtime, budget estimate, and S3 output path.
-
-## Budget defaults
-
-```text
-Total target:    $1
-Planned runs:    5
-Max runtime/run: 5 minutes
-Per-run target:  $0.20
-```
-
-These are editable in the UI.
-
-## Run
+## Start
 
 ```cmd
 docker compose up --build
 ```
 
-Then open:
+Open:
 
 ```text
 http://localhost:7475
 ```
 
 
-## Public Dataset Catalog
+## Balanced subset controls
 
-The Dataset Registry now has a preferred no-file-picker flow:
+The Training Configuration UI now supports an optional deterministic balanced subset:
 
 ```text
-Public Dataset Catalog
-Dataset: CIFAR-10
-Registry version: v3
-
-[ Download & Register to S3 ]
+Use balanced subset: ON
+Train max / class: 200
+Test max / class: 50
+Subset seed: 42
 ```
 
-The backend downloads the official CIFAR-10 source archive once, computes SHA256, uploads that exact archive to the project S3 bucket, and registers its metadata.
+For CIFAR-10 this means approximately:
 
-Each later training run selects the registered S3 version and records its SHA256 and source URL in MLflow.
+```text
+2,000 training images
+500 test images
+```
 
-Manual file upload is still available under **Advanced** for private datasets.
+The subset parameters are sent to SageMaker and recorded automatically in MLflow, so the run remains reproducible.
+
+Researcher training code should accept these optional CLI parameters:
+
+```text
+--use-subset
+--train-max-per-class
+--test-max-per-class
+--subset-seed
+```
+
+
+## Faster dataset registration
+
+Public dataset registration now uses this order:
+
+```text
+1. Check S3 registry/object
+   -> already exists: skip download and upload
+
+2. Check local .dataset_cache
+   -> cache hit: skip internet download
+
+3. HTTP capability probe
+   -> Range requests supported: 4 parallel byte-range downloads
+   -> otherwise: standard single-stream download
+
+4. SHA256
+5. Upload once to S3
+6. Register immutable version
+```
+
+The UI shows:
+
+- download mode
+- progress %
+- downloaded MB / total MB
+- MB/s
+- ETA
+- S3 cache hit
+- local cache hit

@@ -12,3 +12,5 @@ results/*
 !results/.gitkeep
 .local_runs/
 .DS_Store
+/.dataset_cache
+.dataset_cache/cifar-10-python.tar.gz

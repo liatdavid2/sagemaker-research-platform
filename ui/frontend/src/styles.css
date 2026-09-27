@@ -37,3 +37,19 @@ code{color:#d7defc}
 .actionCell{display:flex;align-items:end}
 details{margin:16px 0;padding:12px;border:1px solid #25304d;border-radius:10px}
 summary{cursor:pointer;font-weight:700}
+
+.progressHeader{display:flex;justify-content:space-between;align-items:center;margin:12px 0 7px;color:#dce3ff}
+.progressTrack{height:14px;background:#090e1a;border:1px solid #34405e;border-radius:999px;overflow:hidden}
+.progressFill{height:100%;background:linear-gradient(90deg,#596fff,#7b8cff);transition:width .35s ease}
+
+.inlineProgress{margin-top:12px;max-width:620px;background:#0c1325;border:1px solid #34405e;border-radius:10px;padding:12px}
+.inlineMessage{margin-left:10px}
+.currentRun{margin-top:14px;background:#0c1325;border:1px solid #34405e;border-radius:10px;padding:14px}
+
+.subsetBox{margin:18px 0;padding:16px;background:#0c1325;border:1px solid #34405e;border-radius:12px}
+.checkboxLabel{display:flex;align-items:center;gap:10px;margin:0 0 8px}
+.checkboxLabel input{width:auto;margin:0}
+.subsetSummary{margin-top:10px;padding:10px 12px;background:#10192d;border-radius:8px;color:#c8d2f0}
+
+.progressMeta{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:8px;color:#9eabd0;font-size:13px}
+.progressMeta b{color:#dce3ff}
