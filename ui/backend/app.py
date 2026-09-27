@@ -2,8 +2,10 @@ import hashlib
 import json
 import os
 import subprocess
+import tarfile
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -16,8 +18,10 @@ from sagemaker.inputs import TrainingInput
 
 ROOT = Path(os.getenv("PROJECT_ROOT", "/workspace"))
 TF_DIR = ROOT / "infra" / "terraform"
+CACHE_DIR = ROOT / ".dataset_cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="SageMaker Reproducible Research Platform", version="6.0.0")
+app = FastAPI(title="SageMaker Reproducible Research Platform", version="6.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +35,18 @@ INSTANCE_TYPE = "ml.g4dn.xlarge"
 ALLOWED_COUNTS = {1, 2, 4}
 ALLOWED_FRAMEWORKS = {"pytorch", "tensorflow"}
 SPOT_ESTIMATE = float(os.getenv("ESTIMATED_SPOT_USD_PER_INSTANCE_HOUR", "0.55"))
+
+PUBLIC_DATASETS = {
+    "cifar10": {
+        "key": "cifar10",
+        "name": "CIFAR-10",
+        "description": "60,000 32x32 color images in 10 classes",
+        "source_url": "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz",
+        "filename": "cifar-10-python.tar.gz",
+        "format": "cifar-python-tar",
+        "recommended_version": "v1",
+    }
+}
 
 
 def run_cmd(args, cwd=None):
@@ -89,6 +105,14 @@ def save_registry(registry):
     )
 
 
+def upsert_dataset(item):
+    registry = load_registry()
+    registry["datasets"] = [d for d in registry["datasets"] if d["id"] != item["id"]]
+    registry["datasets"].append(item)
+    save_registry(registry)
+    return item
+
+
 def log(job_id, message):
     jobs[job_id]["logs"].append(str(message))
 
@@ -113,7 +137,6 @@ def estimate_budget(count, minutes, total_budget, planned_runs):
         raise HTTPException(400, "max_minutes must be between 1 and 60")
     if total_budget <= 0 or planned_runs < 1:
         raise HTTPException(400, "Invalid budget configuration")
-
     per_run = total_budget / planned_runs
     estimated = count * (minutes / 60.0) * SPOT_ESTIMATE
     return {
@@ -125,7 +148,12 @@ def estimate_budget(count, minutes, total_budget, planned_runs):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "project": "sagemaker-research-platform-reproducible"}
+    return {"ok": True, "project": "sagemaker-research-platform-reproducible-catalog"}
+
+
+@app.get("/api/catalog")
+def public_catalog():
+    return {"datasets": list(PUBLIC_DATASETS.values())}
 
 
 @app.get("/api/code-version")
@@ -154,6 +182,62 @@ def datasets():
     return load_registry()
 
 
+@app.post("/api/datasets/register-public")
+def register_public_dataset(
+    catalog_key: str = Form(...),
+    version: str = Form(...),
+):
+    if catalog_key not in PUBLIC_DATASETS:
+        raise HTTPException(404, "Public dataset preset not found")
+
+    preset = PUBLIC_DATASETS[catalog_key]
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "id": job_id,
+        "type": "dataset-download",
+        "dataset_name": preset["name"],
+        "version": version,
+        "status": "queued",
+        "logs": [],
+    }
+    launch(job_id, do_register_public_dataset, preset, version)
+    return jobs[job_id]
+
+
+def do_register_public_dataset(job_id, preset, version):
+    bucket = terraform_output("artifact_bucket")
+    safe_name = preset["name"].lower().replace(" ", "-")
+    safe_version = version.strip().replace(" ", "-")
+    local_path = CACHE_DIR / preset["filename"]
+
+    log(job_id, f"Downloading {preset['name']} from official public source")
+    log(job_id, preset["source_url"])
+    urllib.request.urlretrieve(preset["source_url"], local_path)
+
+    sha256 = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    key = f"datasets/{safe_name}/{safe_version}/{preset['filename']}"
+
+    log(job_id, f"Uploading immutable source archive to s3://{bucket}/{key}")
+    s3_client().upload_file(str(local_path), bucket, key)
+
+    item = {
+        "id": f"{safe_name}:{safe_version}",
+        "name": preset["name"],
+        "version": version,
+        "filename": preset["filename"],
+        "s3_uri": f"s3://{bucket}/{key}",
+        "sha256": sha256,
+        "source_type": "public-catalog",
+        "source_url": preset["source_url"],
+        "format": preset["format"],
+        "registered_at": int(time.time()),
+    }
+    upsert_dataset(item)
+    jobs[job_id]["dataset"] = item
+    log(job_id, f"Registered {item['name']}:{item['version']}")
+    log(job_id, f"SHA256: {sha256}")
+
+
 @app.post("/api/datasets/upload")
 async def upload_dataset(
     name: str = Form(...),
@@ -167,7 +251,6 @@ async def upload_dataset(
     safe_name = name.strip().replace(" ", "-")
     safe_version = version.strip().replace(" ", "-")
     key = f"datasets/{safe_name}/{safe_version}/{dataset.filename}"
-
     s3_client().put_object(Bucket=bucket, Key=key, Body=payload)
 
     item = {
@@ -177,14 +260,12 @@ async def upload_dataset(
         "filename": dataset.filename,
         "s3_uri": f"s3://{bucket}/{key}",
         "sha256": sha256,
-        "uploaded_at": int(time.time()),
+        "source_type": "manual-upload",
+        "source_url": None,
+        "format": "user-file",
+        "registered_at": int(time.time()),
     }
-
-    registry = load_registry()
-    registry["datasets"] = [d for d in registry["datasets"] if d["id"] != item["id"]]
-    registry["datasets"].append(item)
-    save_registry(registry)
-    return item
+    return upsert_dataset(item)
 
 
 @app.get("/api/jobs")
@@ -242,7 +323,6 @@ def build_estimator(framework, source_dir, role, count, output, max_minutes, epo
         max_wait=max_minutes * 60 + 300,
         disable_profiler=True,
     )
-
     if framework == "pytorch":
         return PyTorch(framework_version="2.2.0", py_version="py310", **common)
     return TensorFlow(framework_version="2.15.0", py_version="py310", **common)
@@ -294,17 +374,6 @@ def run_sagemaker(
     return jobs[job_id]
 
 
-def parse_metrics(text):
-    metrics = {}
-    for line in str(text).splitlines():
-        if "METRICS" in line:
-            try:
-                metrics.update(json.loads(line.split("METRICS", 1)[1].strip()))
-            except Exception:
-                pass
-    return metrics
-
-
 def do_sagemaker(job_id):
     job = jobs[job_id]
     bucket = terraform_output("artifact_bucket")
@@ -325,22 +394,23 @@ def do_sagemaker(job_id):
 
     log(job_id, f"Dataset: {job['dataset']['name']}:{job['dataset']['version']}")
     log(job_id, f"Dataset SHA256: {job['dataset']['sha256']}")
+    log(job_id, f"Dataset source: {job['dataset'].get('source_url') or 'manual upload'}")
     log(job_id, f"Code commit: {job['git_commit']}")
     log(job_id, f"GPU: {job['instance_count']} x {INSTANCE_TYPE}")
     log(job_id, f"Epochs: {job['epochs']}")
     log(job_id, "Managed Spot: true")
 
-    # Create MLflow run automatically so every cloud execution is tracked.
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
     mlflow.set_experiment("sagemaker-research-platform")
 
     with mlflow.start_run(run_name=f"{job['framework']}-{job_id[:8]}") as active:
         job["mlflow_run_id"] = active.info.run_id
-
         mlflow.log_params({
             "dataset_id": job["dataset"]["id"],
             "dataset_sha256": job["dataset"]["sha256"],
             "dataset_s3_uri": job["dataset"]["s3_uri"],
+            "dataset_source_type": job["dataset"].get("source_type", "unknown"),
+            "dataset_source_url": job["dataset"].get("source_url") or "",
             "git_commit": job["git_commit"],
             "framework": job["framework"],
             "epochs": job["epochs"],
@@ -362,7 +432,6 @@ def do_sagemaker(job_id):
 
         job["elapsed_seconds"] = round(elapsed, 2)
         job["output_path"] = output
-
         mlflow.log_metric("elapsed_seconds", job["elapsed_seconds"])
         mlflow.set_tag("sagemaker_output_path", output)
         mlflow.set_tag("reproducible", "true")

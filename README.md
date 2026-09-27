@@ -100,3 +100,22 @@ Then open:
 ```text
 http://localhost:7475
 ```
+
+
+## Public Dataset Catalog
+
+The Dataset Registry now has a preferred no-file-picker flow:
+
+```text
+Public Dataset Catalog
+Dataset: CIFAR-10
+Registry version: v3
+
+[ Download & Register to S3 ]
+```
+
+The backend downloads the official CIFAR-10 source archive once, computes SHA256, uploads that exact archive to the project S3 bucket, and registers its metadata.
+
+Each later training run selects the registered S3 version and records its SHA256 and source URL in MLflow.
+
+Manual file upload is still available under **Advanced** for private datasets.

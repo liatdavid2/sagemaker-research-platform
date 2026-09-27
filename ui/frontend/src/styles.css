@@ -31,3 +31,9 @@ code{color:#d7defc}
 .heroRun{border-color:#5269ff}
 .runButton{font-size:16px;padding:13px 24px}
 .registry{margin-top:14px}
+
+.catalogBox{background:#0c1325;border:1px solid #34405e;border-radius:12px;padding:16px;margin:14px 0}
+.catalogBox h3{margin-top:0}
+.actionCell{display:flex;align-items:end}
+details{margin:16px 0;padding:12px;border:1px solid #25304d;border-radius:10px}
+summary{cursor:pointer;font-weight:700}
