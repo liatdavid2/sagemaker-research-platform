@@ -95,6 +95,18 @@ def run_cmd_stream(job_id, args, cwd=None):
         raise RuntimeError(output or f"Command failed with exit code {rc}")
     return output
 
+def file_sha256(path, chunk_size=1024 * 1024):
+    """Compute SHA256 without loading the whole file into memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def artifact_bucket():
     return FIXED_ARTIFACT_BUCKET
 

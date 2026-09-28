@@ -242,3 +242,10 @@ The flow now correctly:
 2. verifies whether the exact S3 object already exists,
 3. skips re-download/re-upload when the same dataset version is already present,
 4. otherwise continues with cache/download -> SHA256 -> S3 upload -> registration.
+
+
+## Dataset SHA256 fix
+
+Added the missing `file_sha256()` helper used by public dataset registration.
+It hashes the archive in 1 MB chunks and lets the flow continue from Hashing
+to Uploading to S3 and Registered.
