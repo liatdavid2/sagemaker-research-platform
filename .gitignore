@@ -12,3 +12,4 @@ results/*
 !results/.gitkeep
 .local_runs/
 .DS_Store
+/.code_cache

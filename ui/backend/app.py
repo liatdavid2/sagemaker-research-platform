@@ -235,6 +235,16 @@ def list_jobs():
     return list(jobs.values())[::-1]
 
 
+@app.get("/api/datasets")
+def list_datasets():
+    return load_dataset_registry()
+
+
+@app.get("/api/codes")
+def list_codes():
+    return load_code_registry()
+
+
 
 def detect_platform_resources(force=False):
     """Verify existing AWS resources only; never provision or destroy them."""

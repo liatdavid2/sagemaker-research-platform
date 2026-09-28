@@ -249,3 +249,14 @@ The flow now correctly:
 Added the missing `file_sha256()` helper used by public dataset registration.
 It hashes the archive in 1 MB chunks and lets the flow continue from Hashing
 to Uploading to S3 and Registered.
+
+
+## Registry refresh fix
+
+Restored the missing read endpoints used by the React UI:
+
+- `GET /api/datasets` -> reads `dataset-registry/manifest.json` from the existing S3 bucket.
+- `GET /api/codes` -> reads `code-registry/manifest.json` from the existing S3 bucket.
+
+Training Configuration now repopulates its Dataset and Training code dropdowns from
+the S3 registries during the normal UI refresh/polling cycle.
