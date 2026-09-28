@@ -140,6 +140,28 @@ def load_code_registry():
 def save_code_registry(registry):
     save_json_to_s3("code-registry/manifest.json", registry)
 
+def registry_find_dataset(name, version):
+    """Find an existing dataset registration by logical name + version."""
+    registry = load_dataset_registry()
+    for item in registry.get("datasets", []):
+        if item.get("name") == name and item.get("version") == version:
+            return item
+    return None
+
+def s3_object_exists(s3_uri):
+    """Return True only when the exact registered S3 object exists."""
+    if not s3_uri or not s3_uri.startswith("s3://"):
+        return False
+    path = s3_uri[5:]
+    if "/" not in path:
+        return False
+    bucket, key = path.split("/", 1)
+    try:
+        s3_client().head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
+
 def upsert_dataset(item):
     registry = load_dataset_registry()
     registry["datasets"] = [d for d in registry["datasets"] if d["id"] != item["id"]]
@@ -191,6 +213,16 @@ def estimate_budget(count, minutes, total_budget, planned_runs):
 def health():
     return {"ok": True, "project": "sagemaker-research-platform-full-ui"}
 
+@app.get("/api/catalog")
+def public_catalog():
+    return {"datasets": list(PUBLIC_DATASETS.values())}
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    return list(jobs.values())[::-1]
+
+
 
 def detect_platform_resources(force=False):
     """Verify existing AWS resources only; never provision or destroy them."""
@@ -228,6 +260,17 @@ def detect_platform_resources(force=False):
     platform_status_cache.clear()
     platform_status_cache.update(result)
     return dict(platform_status_cache)
+
+
+@app.get("/api/mlflow-status")
+def mlflow_status():
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://mlflow:5000/health", timeout=2) as response:
+            ok = 200 <= response.status < 300
+        return {"ready": ok, "url": "http://localhost:5050"}
+    except Exception as exc:
+        return {"ready": False, "url": "http://localhost:5050", "error": str(exc)}
 
 
 @app.get("/api/platform-status")

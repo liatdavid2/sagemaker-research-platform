@@ -10,6 +10,7 @@ function App(){
   const [codes,setCodes]=useState([]);
   const [jobs,setJobs]=useState([]);
   const [platform,setPlatform]=useState({ready:false,latest_setup_job:null,bucket:null,role:null});
+  const [mlflowStatus,setMlflowStatus]=useState({ready:false,url:"http://localhost:5050"});
 
   const [catalogKey,setCatalogKey]=useState("cifar10");
   const [publicVersion,setPublicVersion]=useState("v3");
@@ -41,11 +42,16 @@ function App(){
   const [trainingJobId,setTrainingJobId]=useState(null);
 
   async function refresh(){
-    const [cat,d,c,j,p]=await Promise.all([
+    const [cat,d,c,j,p,m]=await Promise.all([
       fetch(`${API}/catalog`),fetch(`${API}/datasets`),fetch(`${API}/codes`),fetch(`${API}/jobs`),
-      fetch(`${API}/platform-status`)
+      fetch(`${API}/platform-status`),fetch(`${API}/mlflow-status`)
     ]);
-    if(cat.ok){const x=await cat.json();setCatalog(x.datasets||[])}
+    if(cat.ok){
+      const x=await cat.json();
+      setCatalog(x.datasets?.length ? x.datasets : [{key:"cifar10",name:"CIFAR-10"}]);
+    } else {
+      setCatalog([{key:"cifar10",name:"CIFAR-10"}]);
+    }
     if(d.ok){
       const x=await d.json();setDatasets(x.datasets||[]);
       if(!datasetId&&x.datasets?.length)setDatasetId(x.datasets[0].id);
@@ -56,6 +62,7 @@ function App(){
     }
     if(j.ok)setJobs(await j.json());
     if(p.ok)setPlatform(await p.json());
+    if(m.ok)setMlflowStatus(await m.json());
   }
 
   async function refreshEstimate(){
@@ -152,6 +159,9 @@ function App(){
 
       <div className="platformActions">
         <a className="linkButton" href="http://localhost:5050" target="_blank" rel="noreferrer">Open MLflow</a>
+        <span className={mlflowStatus.ready ? "good" : "warningText"}>
+          MLflow: {mlflowStatus.ready ? "Running ✓" : "Not reachable"}
+        </span>
       </div>
 
       {platform.storage_ready ? <div className="setupStatus completed">

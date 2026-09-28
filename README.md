@@ -213,3 +213,32 @@ Existing SageMaker role name:
 
 Dataset Registry and Training Code Registry upload directly to the existing S3 bucket.
 The UI only verifies access. Training uses the existing SageMaker IAM role.
+
+
+## Repair: Dataset catalog + MLflow visibility
+
+This build restores the read-only `/api/catalog` and `/api/jobs` endpoints used by
+the React UI. CIFAR-10 therefore appears in the Dataset dropdown again.
+
+MLflow now has a Docker health check and `restart: unless-stopped`. The Platform
+card also shows whether MLflow is reachable at `http://localhost:5050`.
+
+
+## MLflow / SQLAlchemy compatibility fix
+
+MLflow is pinned to `2.16.2` and SQLAlchemy is pinned to `2.0.36`.
+This avoids the SQLAlchemy 2.1 removal of `FallbackAsyncAdaptedQueuePool`,
+which prevents MLflow 2.16.2 from starting with its SQLite backend.
+
+
+## Dataset Registry helper fix
+
+Added the missing `registry_find_dataset()` and `s3_object_exists()` helpers used by
+`Download & Register to S3`.
+
+The flow now correctly:
+
+1. checks the registry manifest,
+2. verifies whether the exact S3 object already exists,
+3. skips re-download/re-upload when the same dataset version is already present,
+4. otherwise continues with cache/download -> SHA256 -> S3 upload -> registration.
